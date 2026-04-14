@@ -53,7 +53,7 @@ class DeadReckoning(Node):
         super().__init__('dead_reckoning')
 
         # Initialize frame
-        self.world_frame = "odom" # world_enu
+        self.world_frame = "world_enu" # world_enu for simulation, odom for real robot
         self.base_footprint_frame = "turtlebot/base_footprint"
 
         # Initialize parameters of the robot

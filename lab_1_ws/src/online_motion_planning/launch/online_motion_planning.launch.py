@@ -3,7 +3,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, TimerAction
 from launch.substitutions import LaunchConfiguration, Command, PathJoinSubstitution
 from launch_ros.actions import Node, PushRosNamespace
-from launch_ros.substitutions import FindPackageShare
+from launch_ros.substitutions import FindPackage, FindPackageShare
 from launch.actions import RegisterEventHandler
 from launch.event_handlers import OnProcessExit
 
@@ -35,11 +35,11 @@ def generate_launch_description():
         executable='rviz2',
         name='rviz2',
         output='screen',
-        arguments=['-d', PathJoinSubstitution([FindPackageShare('online_motion_planning'), 'rviz', 'online_motion_planning.rviz'])]
+        arguments=['-d', PathJoinSubstitution(['src', 'online_motion_planning', 'rviz', 'online_motion_planning.rviz'])]
     )
 
     ld = LaunchDescription([
-        # node_1,
+        node_1,
         node_2,
         node_3,
     ])

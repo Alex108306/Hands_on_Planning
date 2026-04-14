@@ -4,6 +4,7 @@ from rclpy.node import Node
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from sensor_msgs.msg import JointState, Imu
 from geometry_msgs.msg import PoseStamped, Twist, TransformStamped
+from visualization_msgs.msg import Marker, MarkerArray
 import numpy as np
 from tf2_ros import TransformBroadcaster
 from online_motion_planning.RRT_star_algorithm import RRT_Star, fill_path, convert_to_path_index
@@ -12,6 +13,7 @@ from online_motion_planning.Point import Point
 from PIL import Image
 
 from math import atan2
+import math
 
 def quaternion_to_yaw(q):
     """Extract yaw (theta) from geometry_msgs quaternion (x, y, z, w)."""
@@ -34,6 +36,7 @@ class OnlineMotionPlanning(Node):
         self.goal_sub = self.create_subscription(PoseStamped, "/goal_pose", self.goal_callback, 10)
         self.path_pub = self.create_publisher(Path, "/planned_path", 10)
         self.vel_pub = self.create_publisher(Twist, '/turtlebot/cmd_vel', 10)
+        self.marker_pub = self.create_publisher(MarkerArray, '/visualization_marker_array', 10)
         self.inflated_map_pub = self.create_publisher(OccupancyGrid, "/inflated_map", 10)
         self.create_timer(1.0, self.replanning_func)
         self.create_timer(0.1, self.controller_func)
@@ -46,6 +49,10 @@ class OnlineMotionPlanning(Node):
 
         # Initialize robot radius
         self.robot_radius = 0.115
+        self.max_linear_velocity = 0.3
+        self.max_angular_velocity = 0.3
+        self.kv = 0.5
+        self.kw = 0.5
 
         # Initialize robot pose and goal pose
         self.robot_pose = None
@@ -105,7 +112,7 @@ class OnlineMotionPlanning(Node):
         self.grid_map = inflated_grid_map
         
         inflated_map_msg = OccupancyGrid()
-        inflated_map_msg.header.frame_id = "odom" # world_ned for simulation
+        inflated_map_msg.header.frame_id = "world_ned" # world_ned for simulation, odom for real robot
         inflated_map_msg.info.resolution = self.resolution_map
         inflated_map_msg.info.width = self.width_map
         inflated_map_msg.info.height = self.height_map
@@ -129,8 +136,9 @@ class OnlineMotionPlanning(Node):
             goal_pose = self.to_index(self.goal_pose.position.x, self.goal_pose.position.y)
             start = Point(robot_pose[0], robot_pose[1])
             goal = Point(goal_pose[0], goal_pose[1])
+            # self.grid_map = self.grid_map.astype(int).T # For real robot, the grid map is transposed, so we need to transpose it back for RRT* algorithm
             self.grid_map = self.grid_map.astype(int)
-            rrt_star = RRT_Star(grid_map=self.grid_map.T, K=self.K, delta_q=self.delta_q, p=self.p, max_distance=self.max_range, q_start=start, q_goal=goal)
+            rrt_star = RRT_Star(grid_map=self.grid_map, K=self.K, delta_q=self.delta_q, p=self.p, max_distance=self.max_range, q_start=start, q_goal=goal)
             path_first_found, path_converge, edge_goal = rrt_star.run_RRT_Star()
             if len(edge_goal) == 0:
                 self.get_logger().info("No path found")
@@ -148,7 +156,7 @@ class OnlineMotionPlanning(Node):
                 pose_stamped.pose.orientation.z = 0.0
                 pose_stamped.pose.orientation.w = 1.0
                 path_msg.poses.append(pose_stamped)
-            path_msg.header.frame_id = "odom" # world_enu for simulation
+            path_msg.header.frame_id = "world_enu" # world_enu for simulation, odom for real robot
             self.path_pub.publish(path_msg)
         else:
             self.get_logger().info("Goal is not valid")
@@ -180,16 +188,24 @@ class OnlineMotionPlanning(Node):
                 self.vel_pub.publish(self.robot_vel)
                 self.get_logger().info('Goal reached!')
                 return
-            w = wrap_to_pi(atan2(inc_y, inc_x) - theta)
-            # self.get_logger().info(f'{w}')
-            if abs(w) > 0.1:  # e.g., threshold = 0.3
-                v = 0.0             # stop moving forward, rotate in place
+            
+            dist = np.sqrt(inc_x**2 + inc_y**2)
+            desired_yaw = math.atan2(inc_y, inc_x)
+            angle_diff = desired_yaw - theta
+            angle_diff = math.atan2(math.sin(angle_diff), math.cos(angle_diff))
+            w = min(self.kw * angle_diff, self.max_angular_velocity)
+
+            # Only move forward if we are roughly facing the right way
+            if abs(angle_diff) <= 0.3:
+                v = min(self.kv * dist, self.max_linear_velocity)
             else:
-                v = min(k_v * ((inc_x ** 2 + inc_y ** 2) ** 0.5), 0.5)
+                v = 0.0 # Pivot in place
 
             self.robot_vel.linear.x = v
             self.robot_vel.angular.z = w
-            # self.get_logger().info(f"{v}, {w}")
+
+            self.get_logger().info('Publishing velocity command: linear.x="%s", angular.z="%s"' % (self.robot_vel.linear.x, self.robot_vel.angular.z))
+
             self.vel_pub.publish(self.robot_vel)
 
     def is_free_path(self):
@@ -230,7 +246,8 @@ class OnlineMotionPlanning(Node):
     def point_collided(self, point):
         x = round(point[0])
         y = round(point[1])
-        grid_map = self.grid_map.T
+        grid_map = self.grid_map
+        # grid_map = self.grid_map.T # For real robot, the grid map is transposed, so we need to transpose it back to check the collision
         return grid_map[x][y] == 1 or grid_map[x+1][y] == 1 or grid_map[x+1][y+1] == 1 or grid_map[x][y+1] == 1 # round up error compensation
 
     def replanning_func(self):

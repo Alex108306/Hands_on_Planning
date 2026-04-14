@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root BTCPP_format="4">
+  <BehaviorTree ID="DeliverObject">
+    <Fallback>
+      <Sequence>
+        <IsCokeCan object_id="{object_id}"/>
+        <SetBlackboard output_key="way_point"
+                       value="1.5, 1.5"/>
+        <MoveToWaypoint way_point="{way_point}"/>
+      </Sequence>
+      <Sequence>
+        <IsSodaCan object_id="{object_id}"/>
+        <SetBlackboard output_key="way_point"
+                       value="-1.5, -1.5"/>
+        <MoveToWaypoint way_point="{way_point}"/>
+      </Sequence>
+    </Fallback>
+  </BehaviorTree>
+
+  <BehaviorTree ID="Main">
+    <Sequence>
+      <SetBlackboard output_key="num_placed_objects"
+                     value="0"/>
+      <ReactiveFallback>
+        <ObjectsCollectedEqual4 num_placed_objects="{num_placed_objects}"/>
+        <Sequence>
+          <MoveToWaypoint way_point="1.25, 0.5"/>
+          <SubTree ID="WaypointAction"
+                   way_point="1.25, -1.25"/>
+          <SubTree ID="WaypointAction"
+                   way_point="0.0, -1.25"/>
+          <SubTree ID="WaypointAction"
+                   way_point="-0.5, 1.25"/>
+          <SubTree ID="WaypointAction"
+                   way_point="-1.25, 0.5"/>
+          <SubTree ID="WaypointAction"
+                   way_point="0.0, 0.0"/>
+        </Sequence>
+      </ReactiveFallback>
+    </Sequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="WaypointAction">
+    <Sequence>
+      <MoveToWaypoint way_point="{way_point}"/>
+      <Fallback>
+        <Inverter>
+          <CheckObject object_id="{object_id}"/>
+        </Inverter>
+        <Sequence>
+          <PickUpObject/>
+          <SubTree ID="DeliverObject"/>
+          <PlaceObject/>
+          <IncrementObjectCount placed_object="{num_placed_objects}"/>
+        </Sequence>
+      </Fallback>
+    </Sequence>
+  </BehaviorTree>
+
+  <!-- Description of Node Models (used by Groot) -->
+  <TreeNodesModel>
+    <Condition ID="CheckObject"
+               editable="true">
+      <output_port name="object_id"/>
+    </Condition>
+    <Action ID="IncrementObjectCount"
+            editable="true">
+      <input_port name="placed_object"/>
+    </Action>
+    <Condition ID="IsCokeCan"
+               editable="true">
+      <input_port name="object_id"/>
+    </Condition>
+    <Condition ID="IsSodaCan"
+               editable="true">
+      <input_port name="object_id"
+                  default="{object_id}"/>
+    </Condition>
+    <Action ID="MoveToWaypoint"
+            editable="true">
+      <input_port name="way_point"/>
+    </Action>
+    <Condition ID="ObjectsCollectedEqual4"
+               editable="true">
+      <input_port name="num_placed_objects"/>
+    </Condition>
+    <Action ID="PickUpObject"
+            editable="true"/>
+    <Action ID="PlaceObject"
+            editable="true"/>
+    <SubTree ID="WaypointAction"
+             editable="true">
+      <input_port name="way_point"/>
+    </SubTree>
+  </TreeNodesModel>
+
+</root>

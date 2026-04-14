@@ -1,0 +1,88 @@
+## Execution Traces
+
+### Object at p1 (soda), p2(coke), p3(soda), p4(coke)
+
+#### Case 1: From Beginning to finish p1
+```
+--- ticking
+  SetBlackboard(placed_objects=0)
+  ObjectCollectedEqual4 -> Failure
+  MoveToWaypoint(Start) -> Running ...
+
+--- ticking
+  ObjectCollectedEqual4 -> Failure
+  MoveToWaypoint(Start) -> Success
+  Waypoint p1:
+    MoveToWaypoint(p1) -> Running ...
+
+--- ticking
+  ObjectCollectedEqual4 -> Failure
+  Waypoint p1:
+    MoveToWaypoint(P1) -> Success
+    CheckObject -> Success
+    PickUpObject -> Running ...
+
+--- ticking
+  ObjectCollectedEqual4 -> Failure
+  Waypoint p1:
+    PickUpObject -> Success
+    IsCokeCan -> Failure
+    IsSodaCan -> Success
+    SetBlackboard(waypoint=(-1.5,-1.5)) -> Success
+    MoveToWaypoint(Soda bin) -> Running ...
+
+--- ticking
+  ObjectCollectedEqual4 -> Failure
+  Waypoint p1:
+    MoveToWaypoint(Soda bin) -> Success
+    PlaceObject -> Running ...
+
+--- ticking
+  ObjectCollectedEqual4 -> Failure
+  Waypoint p1:
+    PlaceObject -> Success
+    IncrementObjectCount -> Success (placed_objects=1)
+  Waypoint p2:
+    MoveToWaypoint(p2) -> Running ...
+
+```
+#### Case 2: From p4 to finish collecting 4 objects
+```
+
+--- ticking
+  ObjectCollectedEqual4 -> Failure
+  Waypoint p4:
+    MoveToWaypoint(p4) -> Running ...
+
+--- ticking
+  ObjectCollectedEqual4 -> Failure
+  Waypoint p4:
+    MoveToWaypoint(p4) -> Success
+    CheckObject -> Success
+    PickUpObject -> Running ...
+
+--- ticking
+  ObjectCollectedEqual4 -> Failure
+  Waypoint p4:
+    PickUpObject -> Success
+    IsCokeCan ->Success
+    SetBlackboard(waypoint=(1.5,1.5)) -> Success
+    MoveToWaypoint(Coke bin) -> Running ...
+
+--- ticking
+  ObjectCollectedEqual4 -> Failure
+  Waypoint p4:
+    MoveToWaypoint(Coke bin) -> Success
+    PlaceObject -> Running ...
+
+--- ticking
+  ObjectCollectedEqual4 -> Failure
+  Waypoint p4:
+    PlaceObject -> Success
+    IncrementObjectCount -> Success (placed_objects=4)
+
+--- ticking
+  ObjectCollectedEqual4 -> Success
+  Root -> Success
+
+```

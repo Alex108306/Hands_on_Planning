@@ -174,8 +174,8 @@ class GridMapping(Node):
         if self.odom_frame != None:
             try:
                 transform = self.tf_buffer.lookup_transform(
-                    "odom", self.laser_frame, scan_time,
-                    timeout=rclpy.duration.Duration(seconds=2)) # world_ned
+                    "world_ned", self.laser_frame, scan_time,
+                    timeout=rclpy.duration.Duration(seconds=2)) # world_ned for simulation, odom for real robot
             except Exception as e:
                 self.get_logger().error('Transform lookup failed: {}'.format(e))
                 return
@@ -196,7 +196,7 @@ class GridMapping(Node):
 
     def publish_grid_map(self):
         grid_map_msg = OccupancyGrid()
-        grid_map_msg.header.frame_id = "odom" # world_ned
+        grid_map_msg.header.frame_id = "world_ned" # world_ned for simulation, odom for real robot
         grid_map_msg.info.resolution = self.grid_map.cell_size
         grid_map_msg.info.width = self.grid_map.grid.shape[0]
         grid_map_msg.info.height = self.grid_map.grid.shape[1]
