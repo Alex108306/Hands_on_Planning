@@ -11,6 +11,13 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', ['launch/online_motion_planning.launch.py']),
+        (
+            'share/' + package_name + '/rviz',
+            [
+                'online_motion_planning/rviz_HOP.rviz',
+                'online_motion_planning/rviz_HOP_real.rviz',
+            ],
+        ),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -29,6 +36,7 @@ setup(
             'grid_mapping = online_motion_planning.grid_mapping:main',
             'localization_node = online_motion_planning.localization_node:main',
             'online_motion_planning_node = online_motion_planning.online_motion_planning_node:main',
+            'frontier_exploration_node = online_motion_planning.frontier_exploration_node:main',
         ],
     },
 )

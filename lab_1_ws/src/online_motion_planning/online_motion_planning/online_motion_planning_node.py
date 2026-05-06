@@ -5,6 +5,7 @@ from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from sensor_msgs.msg import JointState, Imu
 from geometry_msgs.msg import PoseStamped, Twist, TransformStamped
 from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import Float64MultiArray
 import numpy as np
 from tf2_ros import TransformBroadcaster
 from online_motion_planning.RRT_star_algorithm import RRT_Star, fill_path, convert_to_path_index
@@ -29,6 +30,8 @@ class OnlineMotionPlanning(Node):
 
     def __init__(self):
         super().__init__('online_motion_planning')
+        self.declare_parameter('mode', 'sim')
+        self.mode = self.get_parameter('mode').get_parameter_value().string_value
 
         # Defining node publisher and subcriber
         self.odom_sub = self.create_subscription(Odometry, "/turtlebot/odom", self.odom_callback, 10)
@@ -36,6 +39,11 @@ class OnlineMotionPlanning(Node):
         self.goal_sub = self.create_subscription(PoseStamped, "/goal_pose", self.goal_callback, 10)
         self.path_pub = self.create_publisher(Path, "/planned_path", 10)
         self.vel_pub = self.create_publisher(Twist, '/turtlebot/cmd_vel', 10)
+        self.arm_controller_pub = self.create_publisher(
+            Float64MultiArray,
+            '/turtlebot/swiftpro/joint_velocity_controller/command',
+            10,
+        )
         self.marker_pub = self.create_publisher(MarkerArray, '/visualization_marker_array', 10)
         self.inflated_map_pub = self.create_publisher(OccupancyGrid, "/inflated_map", 10)
         self.create_timer(1.0, self.replanning_func)
@@ -47,10 +55,20 @@ class OnlineMotionPlanning(Node):
         self.width_map, self.height_map = None, None
         self.origin_map = None
 
-        # Initialize robot radius
-        self.robot_radius = 0.115
-        self.max_linear_velocity = 0.3
-        self.max_angular_velocity = 0.3
+        # Initialize mode-dependent planning/control profile
+        if self.mode == 'real':
+            self.robot_radius = 0.08
+            self.max_linear_velocity = 0.5
+            self.max_angular_velocity = 0.5
+            self.map_frame = "odom"
+            self.use_transposed_grid = True
+        else:
+            self.robot_radius = 0.17
+            # self.robot_radius = 0.2
+            self.max_linear_velocity = 0.2
+            self.max_angular_velocity = 0.3
+            self.map_frame = "world_enu"
+            self.use_transposed_grid = False
         self.kv = 0.5
         self.kw = 0.5
 
@@ -71,6 +89,16 @@ class OnlineMotionPlanning(Node):
         # Initizalize control motion variable
         self.robot_vel = Twist()
         self.look_forward = 0.1
+
+    def stop_and_clear_navigation_state(self, reason: str):
+        """Stop robot and clear path/goal state when navigation is invalid."""
+        self.path = None
+        self.path_index = 0
+        self.goal_pose = None
+        self.robot_vel.linear.x = 0.0
+        self.robot_vel.angular.z = 0.0
+        self.vel_pub.publish(self.robot_vel)
+        self.get_logger().info(reason)
 
     def to_index(self, x, y):
         x = int((x - self.origin_map.position.x) / self.resolution_map)
@@ -112,7 +140,7 @@ class OnlineMotionPlanning(Node):
         self.grid_map = inflated_grid_map
         
         inflated_map_msg = OccupancyGrid()
-        inflated_map_msg.header.frame_id = "world_ned" # world_ned for simulation, odom for real robot
+        inflated_map_msg.header.frame_id = "world_ned" # ELCHIN
         inflated_map_msg.info.resolution = self.resolution_map
         inflated_map_msg.info.width = self.width_map
         inflated_map_msg.info.height = self.height_map
@@ -123,6 +151,9 @@ class OnlineMotionPlanning(Node):
 
     def goal_callback(self, msg):
         self.goal_pose = msg.pose
+        arm_control = Float64MultiArray()
+        arm_control.data = [0.0, 0.0, -1.0, 0.0]
+        self.arm_controller_pub.publish(arm_control)
         if self.grid_map is None or self.robot_pose is None:
             self.get_logger().info('Waiting for grid map and robot pose to be available...')
             return
@@ -136,16 +167,19 @@ class OnlineMotionPlanning(Node):
             goal_pose = self.to_index(self.goal_pose.position.x, self.goal_pose.position.y)
             start = Point(robot_pose[0], robot_pose[1])
             goal = Point(goal_pose[0], goal_pose[1])
-            # self.grid_map = self.grid_map.astype(int).T # For real robot, the grid map is transposed, so we need to transpose it back for RRT* algorithm
-            self.grid_map = self.grid_map.astype(int)
+            if self.use_transposed_grid:
+                self.grid_map = self.grid_map.astype(int).T
+            else:
+                self.grid_map = self.grid_map.astype(int)
             rrt_star = RRT_Star(grid_map=self.grid_map, K=self.K, delta_q=self.delta_q, p=self.p, max_distance=self.max_range, q_start=start, q_goal=goal)
             path_first_found, path_converge, edge_goal = rrt_star.run_RRT_Star()
             if len(edge_goal) == 0:
-                self.get_logger().info("No path found")
+                self.stop_and_clear_navigation_state("No path found; stopping and clearing goal.")
                 return
             _, _, path = fill_path(path_converge[0], path_converge[1], edge_goal)
             path_smoothed = rrt_star.smoothing_function(path, path_converge[0])
             self.path = convert_to_path_index(path_converge[0], path_converge[1], path_smoothed)
+            self.path_index = 0
             for i in range(len(self.path[0])):
                 pose_stamped = PoseStamped()
                 pose_stamped.pose.position.x = self.path[0][i] * self.resolution_map + self.origin_map.position.x
@@ -156,25 +190,35 @@ class OnlineMotionPlanning(Node):
                 pose_stamped.pose.orientation.z = 0.0
                 pose_stamped.pose.orientation.w = 1.0
                 path_msg.poses.append(pose_stamped)
-            path_msg.header.frame_id = "world_enu" # world_enu for simulation, odom for real robot
+            path_msg.header.frame_id = self.map_frame
             self.path_pub.publish(path_msg)
         else:
-            self.get_logger().info("Goal is not valid")
+            self.stop_and_clear_navigation_state("Goal is not valid; stopping and clearing goal.")
     
     def controller_func(self):
         if self.path is None or self.goal_pose is None:
             return
         else:
+            if len(self.path[0]) == 0:
+                self.stop_and_clear_navigation_state("Empty path; stopping.")
+                return
+            if self.path_index >= len(self.path[0]):
+                self.path_index = len(self.path[0]) - 1
+
             k_v = 0.5
             x, y = self.robot_pose.pose.pose.position.x, self.robot_pose.pose.pose.position.y
             # self.get_logger().info('Look forward to next path point: "%s" "%s"' % (self.path[0][self.path_index] * self.resolution_map + self.origin_map.position.x, self.path[1][self.path_index] * self.resolution_map + self.origin_map.position.y))
-            if self.path_index == len(self.path[0]) - 1:
-                x_g, y_g = self.goal_pose.position.x, self.goal_pose.position.y
-            else:
-                if np.linalg.norm([self.path[0][self.path_index] * self.resolution_map + self.origin_map.position.x - x,
-                                   self.path[1][self.path_index] * self.resolution_map + self.origin_map.position.y - y]) < self.look_forward:
-                    self.path_index += 1
-                x_g, y_g = self.path[0][self.path_index] * self.resolution_map + self.origin_map.position.x, self.path[1][self.path_index] * self.resolution_map + self.origin_map.position.y
+            # Always follow the planned path points (never switch directly to raw goal pose).
+            current_x = self.path[0][self.path_index] * self.resolution_map + self.origin_map.position.x
+            current_y = self.path[1][self.path_index] * self.resolution_map + self.origin_map.position.y
+            if (
+                self.path_index < len(self.path[0]) - 1
+                and np.linalg.norm([current_x - x, current_y - y]) < self.look_forward
+            ):
+                self.path_index += 1
+                current_x = self.path[0][self.path_index] * self.resolution_map + self.origin_map.position.x
+                current_y = self.path[1][self.path_index] * self.resolution_map + self.origin_map.position.y
+            x_g, y_g = current_x, current_y
             robot_orientation = self.robot_pose.pose.pose.orientation
             theta = quaternion_to_yaw(robot_orientation)
             inc_x = x_g - x
@@ -196,7 +240,7 @@ class OnlineMotionPlanning(Node):
             w = min(self.kw * angle_diff, self.max_angular_velocity)
 
             # Only move forward if we are roughly facing the right way
-            if abs(angle_diff) <= 0.3:
+            if abs(angle_diff) <= 0.3: # 0.3 before
                 v = min(self.kv * dist, self.max_linear_velocity)
             else:
                 v = 0.0 # Pivot in place
@@ -246,8 +290,10 @@ class OnlineMotionPlanning(Node):
     def point_collided(self, point):
         x = round(point[0])
         y = round(point[1])
-        grid_map = self.grid_map
-        # grid_map = self.grid_map.T # For real robot, the grid map is transposed, so we need to transpose it back to check the collision
+        if self.use_transposed_grid:
+            grid_map = self.grid_map.T
+        else:
+            grid_map = self.grid_map
         return grid_map[x][y] == 1 or grid_map[x+1][y] == 1 or grid_map[x+1][y+1] == 1 or grid_map[x][y+1] == 1 # round up error compensation
 
     def replanning_func(self):

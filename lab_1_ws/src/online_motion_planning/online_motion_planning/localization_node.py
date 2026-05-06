@@ -51,9 +51,16 @@ class DeadReckoning(Node):
 
     def __init__(self):
         super().__init__('dead_reckoning')
+        self.declare_parameter('mode', 'sim')
+        self.mode = self.get_parameter('mode').get_parameter_value().string_value
 
-        # Initialize frame
-        self.world_frame = "world_enu" # world_enu for simulation, odom for real robot
+        # Initialize frame/profile
+        if self.mode == 'real':
+            self.world_frame = "odom"
+            self.noise_scale = 0.0
+        else:
+            self.world_frame = "world_enu"
+            self.noise_scale = 0.0
         self.base_footprint_frame = "turtlebot/base_footprint"
 
         # Initialize parameters of the robot
@@ -189,8 +196,15 @@ class DeadReckoning(Node):
         right_wheel_velocity = msg.velocity[1]
 
         # Adding noise to the wheel encoder sensor
-        wheel_velocity = np.array([[left_wheel_velocity], [right_wheel_velocity]]) + np.random.normal(np.zeros((2,1)), np.array([np.sqrt(self.covariance_wheel_encoder.diagonal())]).T)
-
+        # wheel_velocity = np.array([[left_wheel_velocity], [right_wheel_velocity]]) + np.random.normal(np.zeros((2,1)), np.array([np.sqrt(self.covariance_wheel_encoder.diagonal())]).T)
+        wheel_velocity = (
+            np.array([[left_wheel_velocity], [right_wheel_velocity]])
+            + self.noise_scale
+            * np.random.normal(
+                np.zeros((2, 1)),
+                np.array([np.sqrt(self.covariance_wheel_encoder.diagonal())]).T,
+            )
+        )
         # Predict pose of robot with covariance
         xk_bar, Pk_bar = self.Prediction(wheel_velocity, dt)
 

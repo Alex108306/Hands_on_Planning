@@ -120,6 +120,10 @@ class GridMapping(Node):
 
     def __init__(self):
         super().__init__('grid_mapping')
+        self.declare_parameter('mode', 'sim')
+        self.mode = self.get_parameter('mode').get_parameter_value().string_value
+        self.world_frame = "odom" if self.mode == "real" else "world_ned"
+        self.map_publish_period = 0.7 if self.mode == "real" else 0.5
 
         # Subscribers and publishers
         self.scan_sub = self.create_subscription(LaserScan, '/turtlebot/scan', self.recieve_scan, 10)
@@ -127,7 +131,7 @@ class GridMapping(Node):
         self.grid_map_pub = self.create_publisher(OccupancyGrid, '/projected_map', 10)
 
         # Creating timer
-        self.timer_publish = self.create_timer(0.9, self.process_grid_map) # 0.9 for real robot, 0.5 for simulation
+        self.timer_publish = self.create_timer(self.map_publish_period, self.process_grid_map)
 
         # TF
         self.tf_buffer = Buffer(cache_time=rclpy.duration.Duration(seconds=10))
@@ -174,8 +178,8 @@ class GridMapping(Node):
         if self.odom_frame != None:
             try:
                 transform = self.tf_buffer.lookup_transform(
-                    "world_ned", self.laser_frame, scan_time,
-                    timeout=rclpy.duration.Duration(seconds=2)) # world_ned for simulation, odom for real robot
+                    self.world_frame, self.laser_frame, scan_time,
+                    timeout=rclpy.duration.Duration(seconds=2))
             except Exception as e:
                 self.get_logger().error('Transform lookup failed: {}'.format(e))
                 return
@@ -196,7 +200,7 @@ class GridMapping(Node):
 
     def publish_grid_map(self):
         grid_map_msg = OccupancyGrid()
-        grid_map_msg.header.frame_id = "world_ned" # world_ned for simulation, odom for real robot
+        grid_map_msg.header.frame_id = self.world_frame
         grid_map_msg.info.resolution = self.grid_map.cell_size
         grid_map_msg.info.width = self.grid_map.grid.shape[0]
         grid_map_msg.info.height = self.grid_map.grid.shape[1]
