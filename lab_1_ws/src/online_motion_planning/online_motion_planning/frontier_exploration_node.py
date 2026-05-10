@@ -3,9 +3,10 @@ from collections import deque
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.node import Node
+from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
 
@@ -29,7 +30,11 @@ class FrontierExplorationNode(Node):
         self.odom_sub = self.create_subscription(
             Odometry, "/turtlebot/odom", self.odom_callback, 10
         )
+        self.goal_feedback_sub = self.create_subscription(
+            String, "/goal_feedback", self.goal_feedback_callback, 10
+        )
         self.goal_pub = self.create_publisher(PoseStamped, "/goal_pose", 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, "/turtlebot/cmd_vel", 10)
         self.centroid_markers_pub = self.create_publisher(
             MarkerArray, "/frontier_centroids", 10
         )
@@ -51,14 +56,22 @@ class FrontierExplorationNode(Node):
             self.min_goal_distance_cells = 20
             self.goal_reached_distance_m = 0.05
             self.goal_timeout_sec = 30
-            self.blacklist_duration_sec = 30
+            self.blacklist_duration_sec = 5
             self.blacklist_radius_cells = 6
+            self.progress_check_sec = 20.0
+            self.min_progress_m = 0.03
+            self.inward_goal_offset_cells = 15
+            self.reachable_seed_search_radius_cells = 8
         else:
             self.min_goal_distance_cells = 20
             self.goal_reached_distance_m = 0.25
             self.goal_timeout_sec = 50
             self.blacklist_duration_sec = 45
             self.blacklist_radius_cells = 6
+            self.progress_check_sec = 20
+            self.min_progress_m = 0.03
+            self.inward_goal_offset_cells = 8
+            self.reachable_seed_search_radius_cells = 4
         self.min_new_goal_separation_cells = 4
 
         # Occupancy interpretation for this map format (0..100 probabilities)
@@ -69,8 +82,8 @@ class FrontierExplorationNode(Node):
         self.goal_clearance_cells = 2
         self.border_margin_cells = 20
         self.unknown_clearance_radius = 1
-        self.inward_goal_offset_cells = 8
-        self.reachable_seed_search_radius_cells = 4
+        
+        
         self.info_gain_radius_cells = 10
         self.w_gain = 0.7
         self.w_dist = 0.3
@@ -82,8 +95,7 @@ class FrontierExplorationNode(Node):
         self.last_published_goal_cell = None
         self.active_goal_time = None
         self.goal_start_robot_xy = None
-        self.progress_check_sec = 10.0
-        self.min_progress_m = 0.03
+        
 
         # Avoid repeatedly choosing unreachable goals.
         self.goal_blacklist = {}
@@ -91,6 +103,14 @@ class FrontierExplorationNode(Node):
         # RViz centroid markers
         self.centroid_marker_scale_m = 0.16
         self.centroid_text_size_m = 0.12
+
+        # Startup spin is handled by online_motion_planning_node (single cmd_vel owner).
+        self.startup_spin_enabled = False
+        self.startup_spin_done = True
+        self.startup_spin_started = False
+        self.startup_spin_start_time = None
+        self.startup_spin_angular_speed = 0.6
+        self.startup_spin_duration_sec = (2.0 * math.pi) / self.startup_spin_angular_speed
 
     def map_callback(self, msg: OccupancyGrid):
         self.map_msg = msg
@@ -117,6 +137,25 @@ class FrontierExplorationNode(Node):
             msg.pose.pose.position.x,
             msg.pose.pose.position.y,
         )
+
+    def goal_feedback_callback(self, msg: String):
+        feedback = msg.data.strip().lower()
+        if feedback not in ("goal_invalid", "no_path"):
+            return
+        if self.active_goal_world is None:
+            return
+
+        self.get_logger().info(
+            "Planner reported %s; resetting active frontier goal immediately." % feedback
+        )
+        self.blacklist_goal(
+            self.active_goal_cell,
+            "planner-" + feedback,
+            cluster_cells=self.active_goal_cluster,
+        )
+        self.reset_active_goal()
+        # Trigger immediate reselection instead of waiting for next timer tick.
+        self.update_goal()
 
     def is_free(self, value: int) -> bool:
         return value >= 0 and value <= self.free_threshold
@@ -351,6 +390,16 @@ class FrontierExplorationNode(Node):
             return True
         return self.inflated_map[x_idx, y_idx] < self.occupied_threshold
 
+    def is_cell_valid_for_planner(self, x_idx, y_idx):
+        """
+        Mirror online_motion_planning_node.is_valid() on inflated occupancy data.
+        Planner checks <= 0.5 on a 0..1 inflated grid. Here inflated_map is 0..100,
+        so the equivalent threshold is <= 50.
+        """
+        if self.inflated_map is None:
+            return False
+        return self.inflated_map[x_idx, y_idx] <= self.occupied_threshold
+
     def is_goal_cell_valid(self, x_idx, y_idx):
         # Ignore map-border cells where projected map artifacts are common.
         if (
@@ -359,6 +408,10 @@ class FrontierExplorationNode(Node):
             or x_idx >= self.width - self.border_margin_cells
             or y_idx >= self.height - self.border_margin_cells
         ):
+            return False
+
+        # Enforce planner-equivalent validity before extra frontier heuristics.
+        if not self.is_cell_valid_for_planner(x_idx, y_idx):
             return False
 
         if not self.is_cell_free_in_inflated_map(x_idx, y_idx):
@@ -403,7 +456,12 @@ class FrontierExplorationNode(Node):
         return (vx_total / norm, vy_total / norm)
 
     def frontier_to_interior_goal(
-        self, frontier_cell, robot_cell, inward_direction, reachable_cells
+        self,
+        frontier_cell,
+        robot_cell,
+        inward_direction,
+        reachable_cells,
+        ignore_blacklist=False,
     ):
         fx, fy = frontier_cell
         direction = inward_direction
@@ -425,7 +483,7 @@ class FrontierExplorationNode(Node):
                 < self.min_new_goal_separation_cells
             ):
                 continue
-            if self.is_blacklisted((gx, gy)):
+            if (not ignore_blacklist) and self.is_blacklisted((gx, gy)):
                 continue
             if not self.is_goal_cell_valid(gx, gy):
                 continue
@@ -468,27 +526,47 @@ class FrontierExplorationNode(Node):
             )
         ]
 
-        for cluster in sorted_clusters:
-            inward_direction = self.cluster_inward_direction(cluster)
-            # Reuse min-distance rule first, then fallback to closest.
-            far_enough = [
-                cell
-                for cell in cluster
-                if self.euclidean(robot_cell, cell) >= self.min_goal_distance_cells
-            ]
-            ordered_candidates = sorted(
-                far_enough if far_enough else list(cluster),
-                key=lambda cell: self.euclidean(robot_cell, cell),
-            )
-
-            for cand in ordered_candidates:
-                if self.is_blacklisted(cand):
-                    continue
-                interior_goal = self.frontier_to_interior_goal(
-                    cand, robot_cell, inward_direction, reachable_cells
+        def try_select(ignore_blacklist=False):
+            for cluster in sorted_clusters:
+                inward_direction = self.cluster_inward_direction(cluster)
+                # Reuse min-distance rule first, then fallback to closest.
+                far_enough = [
+                    cell
+                    for cell in cluster
+                    if self.euclidean(robot_cell, cell) >= self.min_goal_distance_cells
+                ]
+                ordered_candidates = sorted(
+                    far_enough if far_enough else list(cluster),
+                    key=lambda cell: self.euclidean(robot_cell, cell),
                 )
-                if interior_goal is not None:
-                    return (interior_goal, cluster)
+
+                for cand in ordered_candidates:
+                    if (not ignore_blacklist) and self.is_blacklisted(cand):
+                        continue
+                    interior_goal = self.frontier_to_interior_goal(
+                        cand,
+                        robot_cell,
+                        inward_direction,
+                        reachable_cells,
+                        ignore_blacklist=ignore_blacklist,
+                    )
+                    if interior_goal is not None:
+                        return (interior_goal, cluster)
+            return (None, None)
+
+        goal_cell, source_cluster = try_select(ignore_blacklist=False)
+        if goal_cell is not None:
+            return (goal_cell, source_cluster)
+
+        # Recovery mode: if blacklist removed all options (common when only one
+        # cluster exists), allow selecting from currently blacklisted cells to
+        # avoid deadlock.
+        self.get_logger().warn(
+            "No valid frontier after blacklist filtering; retrying selection by temporarily ignoring blacklist."
+        )
+        goal_cell, source_cluster = try_select(ignore_blacklist=True)
+        if goal_cell is not None:
+            return (goal_cell, source_cluster)
 
         return (None, None)
 
@@ -589,9 +667,33 @@ class FrontierExplorationNode(Node):
         self.active_goal_time = None
         self.goal_start_robot_xy = None
 
+    def publish_spin_cmd(self, angular_z):
+        cmd = Twist()
+        cmd.linear.x = 0.0
+        cmd.angular.z = float(angular_z)
+        self.cmd_vel_pub.publish(cmd)
+
     def update_goal(self):
         if self.grid_map is None or self.robot_xy is None:
             return
+
+        if not self.startup_spin_done:
+            now_s = self.now_seconds()
+            if not self.startup_spin_started:
+                self.startup_spin_started = True
+                self.startup_spin_start_time = now_s
+                self.get_logger().info(
+                    "Starting one-time startup spin before frontier exploration."
+                )
+            elapsed = now_s - self.startup_spin_start_time
+            if elapsed < self.startup_spin_duration_sec:
+                self.publish_spin_cmd(self.startup_spin_angular_speed)
+                return
+
+            self.publish_spin_cmd(0.0)
+            self.startup_spin_done = True
+            self.get_logger().info("Startup spin completed. Beginning frontier exploration.")
+
         self.cleanup_blacklist()
 
         # Keep current goal until reached, but reset if it times out.

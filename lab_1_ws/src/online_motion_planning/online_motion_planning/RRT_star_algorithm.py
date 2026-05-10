@@ -145,7 +145,20 @@ class RRT_Star:
         current_idx = path[-1]
         first = 0
         while current_idx != path[0]:
-            while self.IS_FREE_SEGMENT(G_vertex[current_idx], G_vertex[path[first]], self.c_space, depth=0, max_depth=np.log2(G_vertex[current_idx].dist(G_vertex[path[first]]))) == False:
+            while True:
+                segment_dist = G_vertex[current_idx].dist(G_vertex[path[first]])
+                # Guard against log2(0) / negative depths for very short segments.
+                # Keep at least one recursion level so collision checks remain active.
+                max_depth = max(1, int(np.ceil(np.log2(max(segment_dist, 1.0)))))
+                is_free = self.IS_FREE_SEGMENT(
+                    G_vertex[current_idx],
+                    G_vertex[path[first]],
+                    self.c_space,
+                    depth=0,
+                    max_depth=max_depth,
+                )
+                if is_free:
+                    break
                 if path[first] + 1  == current_idx:
                     break
                 first += 1
