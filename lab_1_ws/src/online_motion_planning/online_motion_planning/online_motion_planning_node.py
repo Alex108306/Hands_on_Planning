@@ -59,12 +59,12 @@ class OnlineMotionPlanning(Node):
         # Initialize mode-dependent planning/control profile
         if self.mode == 'real':
             self.robot_radius = 0.16
-            self.max_linear_velocity = 0.5
-            self.max_angular_velocity = 1.5
+            self.max_linear_velocity = 0.35
+            self.max_angular_velocity = 1.75
             self.map_frame = "odom"
             self.use_transposed_grid = True
             # Real robot actuator deadband compensation.
-            self.linear_deadband = 0.2
+            self.linear_deadband = 0.15
             self.angular_deadband = 0.65
             self.linear_zero_epsilon = 0.02
             self.angular_zero_epsilon = 0.05
@@ -110,6 +110,7 @@ class OnlineMotionPlanning(Node):
         self.startup_spin_last_yaw = None
         self.startup_spin_announced = False
         self.startup_spin_completed_announced = False
+        self.startup_spin_feedback_sent = False
         self.debug_planner_diagnostics = self.mode == "real"
 
     def stop_and_clear_navigation_state(self, reason: str):
@@ -157,11 +158,17 @@ class OnlineMotionPlanning(Node):
 
     def is_valid(self, x, y):
         cell_x, cell_y = self.to_index(x, y)
-        # self.get_logger().info('self.grid_map[cell_x, cell_y]: "%s"' % self.grid_map[cell_x, cell_y])
-        if self.grid_map[cell_x, cell_y] <= 0.5:
-            return True
-        else:
+        planner_grid = self.grid_map.T if self.use_transposed_grid else self.grid_map
+        if (
+            planner_grid is None
+            or cell_x < 0
+            or cell_y < 0
+            or cell_x >= planner_grid.shape[0]
+            or cell_y >= planner_grid.shape[1]
+        ):
             return False
+        # Match planning grid convention and occupancy criterion exactly.
+        return planner_grid[cell_x, cell_y] <= 0.5
 
     def find_nearest_rrt_start_seed(self, start_cell, planner_grid):
         sx, sy = int(start_cell[0]), int(start_cell[1])
@@ -300,16 +307,15 @@ class OnlineMotionPlanning(Node):
             robot_pose = robot_cell
             goal_pose = goal_cell
             if self.use_transposed_grid:
-                planner_grid = self.grid_map.astype(int).T #elchin
+                planner_grid = self.grid_map.astype(int).T
             else:
                 planner_grid = self.grid_map.astype(int)
-            self.grid_map = planner_grid
             if self.debug_planner_diagnostics:
                 self.get_logger().info(
                     "[PLAN_DIAG] planner_grid_shape=%s transpose_applied=%s"
                     % (str(planner_grid.shape), str(self.use_transposed_grid))
                 )
-            start_seed = self.find_nearest_rrt_start_seed(robot_pose, self.grid_map)
+            start_seed = self.find_nearest_rrt_start_seed(robot_pose, planner_grid)
             if start_seed is None:
                 self.publish_goal_feedback("start_invalid")
                 self.get_logger().warn(
@@ -328,7 +334,7 @@ class OnlineMotionPlanning(Node):
                 )
             start = Point(start_seed[0], start_seed[1])
             goal = Point(goal_pose[0], goal_pose[1])
-            rrt_star = RRT_Star(grid_map=self.grid_map, K=self.K, delta_q=self.delta_q, p=self.p, max_distance=self.max_range, q_start=start, q_goal=goal)
+            rrt_star = RRT_Star(grid_map=planner_grid, K=self.K, delta_q=self.delta_q, p=self.p, max_distance=self.max_range, q_start=start, q_goal=goal)
             path_first_found, path_converge, edge_goal = rrt_star.run_RRT_Star()
             if len(edge_goal) == 0:
                 self.publish_goal_feedback("no_path")
@@ -353,10 +359,10 @@ class OnlineMotionPlanning(Node):
                     cy = int(self.path[1][idx])
                     if idx < 5 or idx >= max(0, total - 5):
                         sample_cells.append((cx, cy))
-                    if not (0 <= cx < self.grid_map.shape[0] and 0 <= cy < self.grid_map.shape[1]):
+                    if not (0 <= cx < planner_grid.shape[0] and 0 <= cy < planner_grid.shape[1]):
                         out_of_bounds += 1
                         continue
-                    if self.grid_map[cx, cy] > 0:
+                    if planner_grid[cx, cy] > 0:
                         occupied += 1
                 self.get_logger().info(
                     "[PLAN_DIAG] path_points=%d out_of_bounds=%d occupied_cells=%d sample_cells=%s"
@@ -407,6 +413,9 @@ class OnlineMotionPlanning(Node):
                 self.robot_vel.angular.z = 0.0
                 self.vel_pub.publish(self.robot_vel)
                 self.get_logger().info("Startup spin completed. Starting exploration control.")
+                if not self.startup_spin_feedback_sent:
+                    self.publish_goal_feedback("startup_spin_done")
+                    self.startup_spin_feedback_sent = True
             return
 
         if self.startup_spin_done and not self.startup_spin_completed_announced:
@@ -415,6 +424,9 @@ class OnlineMotionPlanning(Node):
             self.robot_vel.angular.z = 0.0
             self.vel_pub.publish(self.robot_vel)
             self.get_logger().info("Startup spin completed. Starting exploration control.")
+            if not self.startup_spin_feedback_sent:
+                self.publish_goal_feedback("startup_spin_done")
+                self.startup_spin_feedback_sent = True
 
         if self.path is None and self.goal_pose is not None:
             self.planning()
@@ -528,7 +540,7 @@ class OnlineMotionPlanning(Node):
         x = round(point[0])
         y = round(point[1])
         if self.use_transposed_grid:
-            grid_map = self.grid_map.T #ELCHIN
+            grid_map = self.grid_map.T
         else:
             grid_map = self.grid_map
         return grid_map[x][y] == 1 or grid_map[x+1][y] == 1 or grid_map[x+1][y+1] == 1 or grid_map[x][y+1] == 1 # round up error compensation

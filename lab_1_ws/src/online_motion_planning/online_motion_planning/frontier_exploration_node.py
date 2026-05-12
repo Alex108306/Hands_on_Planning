@@ -3,7 +3,7 @@ from collections import deque
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import Point, PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -15,6 +15,7 @@ class FrontierExplorationNode(Node):
         super().__init__("frontier_exploration_node")
         self.declare_parameter('mode', 'sim')
         self.mode = self.get_parameter('mode').get_parameter_value().string_value
+        # Keep frontier map interpretation aligned with current real-robot map publishing.
         self.use_transposed_grid = self.mode == "real"
 
         # Topics in this project:
@@ -35,6 +36,9 @@ class FrontierExplorationNode(Node):
         )
         self.goal_pub = self.create_publisher(PoseStamped, "/goal_pose", 10)
         self.cmd_vel_pub = self.create_publisher(Twist, "/turtlebot/cmd_vel", 10)
+        self.frontier_markers_pub = self.create_publisher(
+            MarkerArray, "/frontier_cells", 10
+        )
         self.centroid_markers_pub = self.create_publisher(
             MarkerArray, "/frontier_centroids", 10
         )
@@ -50,16 +54,18 @@ class FrontierExplorationNode(Node):
         self.origin = None
         self.odom_frame = "world_enu"
         self.robot_xy = None
+        self.robot_yaw = None
 
         # Goal selection settings
         if self.mode == "real":
             self.min_goal_distance_cells = 20
             self.goal_reached_distance_m = 0.05
             self.goal_timeout_sec = 30
-            self.blacklist_duration_sec = 5
+            self.blacklist_duration_sec = 10
             self.blacklist_radius_cells = 6
             self.progress_check_sec = 20.0
             self.min_progress_m = 0.03
+            self.heading_alignment_threshold_rad = 0.3
             self.inward_goal_offset_cells = 15
             self.reachable_seed_search_radius_cells = 8
         else:
@@ -70,6 +76,7 @@ class FrontierExplorationNode(Node):
             self.blacklist_radius_cells = 6
             self.progress_check_sec = 20
             self.min_progress_m = 0.03
+            self.heading_alignment_threshold_rad = 0.3
             self.inward_goal_offset_cells = 8
             self.reachable_seed_search_radius_cells = 4
         self.min_new_goal_separation_cells = 4
@@ -103,10 +110,11 @@ class FrontierExplorationNode(Node):
         # RViz centroid markers
         self.centroid_marker_scale_m = 0.16
         self.centroid_text_size_m = 0.12
+        self.frontier_marker_scale_m = 0.04
 
         # Startup spin is handled by online_motion_planning_node (single cmd_vel owner).
-        self.startup_spin_enabled = False
-        self.startup_spin_done = True
+        self.startup_spin_enabled = self.mode == "real"
+        self.startup_spin_done = not self.startup_spin_enabled
         self.startup_spin_started = False
         self.startup_spin_start_time = None
         self.startup_spin_angular_speed = 0.6
@@ -137,9 +145,20 @@ class FrontierExplorationNode(Node):
             msg.pose.pose.position.x,
             msg.pose.pose.position.y,
         )
+        q = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.robot_yaw = math.atan2(siny_cosp, cosy_cosp)
 
     def goal_feedback_callback(self, msg: String):
         feedback = msg.data.strip().lower()
+        if feedback == "startup_spin_done":
+            if not self.startup_spin_done:
+                self.startup_spin_done = True
+                self.get_logger().info(
+                    "Startup spin completion received; frontier goal publishing enabled."
+                )
+            return
         if feedback not in ("goal_invalid", "no_path"):
             return
         if self.active_goal_world is None:
@@ -148,11 +167,12 @@ class FrontierExplorationNode(Node):
         self.get_logger().info(
             "Planner reported %s; resetting active frontier goal immediately." % feedback
         )
-        self.blacklist_goal(
-            self.active_goal_cell,
-            "planner-" + feedback,
-            cluster_cells=self.active_goal_cluster,
-        )
+        if self.should_blacklist_active_goal_cluster():
+            self.blacklist_goal(
+                self.active_goal_cell,
+                "planner-" + feedback,
+                cluster_cells=self.active_goal_cluster,
+            )
         self.reset_active_goal()
         # Trigger immediate reselection instead of waiting for next timer tick.
         self.update_goal()
@@ -383,6 +403,33 @@ class FrontierExplorationNode(Node):
         expired = [cell for cell, t in self.goal_blacklist.items() if now_t >= t]
         for cell in expired:
             del self.goal_blacklist[cell]
+
+    def count_reachable_frontier_clusters(self):
+        if self.grid_map is None or self.robot_xy is None:
+            return None
+        robot_cell = self.world_to_cell(self.robot_xy[0], self.robot_xy[1])
+        if robot_cell is None:
+            return None
+        reachable_cells = self.compute_reachable_cells(robot_cell)
+        if not reachable_cells:
+            return 0
+        frontiers = self.detect_frontiers()
+        if not frontiers:
+            return 0
+        frontiers = [cell for cell in frontiers if cell in reachable_cells]
+        if not frontiers:
+            return 0
+        clusters = self.cluster_frontiers(frontiers)
+        return len(clusters)
+
+    def should_blacklist_active_goal_cluster(self):
+        cluster_count = self.count_reachable_frontier_clusters()
+        if cluster_count == 1:
+            self.get_logger().info(
+                "Only one reachable frontier cluster remains; skipping blacklist for current goal."
+            )
+            return False
+        return True
 
     def is_cell_free_in_inflated_map(self, x_idx, y_idx):
         if self.inflated_map is None:
@@ -645,10 +692,60 @@ class FrontierExplorationNode(Node):
 
         self.centroid_markers_pub.publish(marker_array)
 
+    def publish_frontier_cells(self, frontier_cells):
+        marker_array = MarkerArray()
+
+        clear_marker = Marker()
+        clear_marker.action = Marker.DELETEALL
+        marker_array.markers.append(clear_marker)
+
+        if self.map_msg is None or self.origin is None or self.resolution is None:
+            self.frontier_markers_pub.publish(marker_array)
+            return
+
+        points_marker = Marker()
+        points_marker.header.frame_id = self.map_msg.header.frame_id
+        points_marker.header.stamp = self.get_clock().now().to_msg()
+        points_marker.ns = "frontier_cells"
+        points_marker.id = 0
+        points_marker.type = Marker.POINTS
+        points_marker.action = Marker.ADD
+        points_marker.pose.orientation.w = 1.0
+        points_marker.scale.x = self.frontier_marker_scale_m
+        points_marker.scale.y = self.frontier_marker_scale_m
+        points_marker.color.r = 1.0
+        points_marker.color.g = 0.2
+        points_marker.color.b = 0.8
+        points_marker.color.a = 0.9
+
+        for x_idx, y_idx in frontier_cells:
+            p = Point()
+            p.x = self.origin.position.x + (x_idx + 0.5) * self.resolution
+            p.y = self.origin.position.y + (y_idx + 0.5) * self.resolution
+            p.z = 0.02
+            points_marker.points.append(p)
+
+        marker_array.markers.append(points_marker)
+        self.frontier_markers_pub.publish(marker_array)
+
     def is_goal_reached(self):
         if self.active_goal_world is None or self.robot_xy is None:
             return False
         return self.euclidean(self.robot_xy, self.active_goal_world) <= self.goal_reached_distance_m
+
+    def is_still_aligning_heading_to_goal(self):
+        if self.active_goal_world is None or self.robot_xy is None or self.robot_yaw is None:
+            return False
+        dx = self.active_goal_world[0] - self.robot_xy[0]
+        dy = self.active_goal_world[1] - self.robot_xy[1]
+        if math.hypot(dx, dy) < self.goal_reached_distance_m:
+            return False
+        desired_yaw = math.atan2(dy, dx)
+        yaw_error = math.atan2(
+            math.sin(desired_yaw - self.robot_yaw),
+            math.cos(desired_yaw - self.robot_yaw),
+        )
+        return abs(yaw_error) > self.heading_alignment_threshold_rad
 
     def publish_goal(self, goal_world_xy):
         goal_msg = PoseStamped()
@@ -678,21 +775,7 @@ class FrontierExplorationNode(Node):
             return
 
         if not self.startup_spin_done:
-            now_s = self.now_seconds()
-            if not self.startup_spin_started:
-                self.startup_spin_started = True
-                self.startup_spin_start_time = now_s
-                self.get_logger().info(
-                    "Starting one-time startup spin before frontier exploration."
-                )
-            elapsed = now_s - self.startup_spin_start_time
-            if elapsed < self.startup_spin_duration_sec:
-                self.publish_spin_cmd(self.startup_spin_angular_speed)
-                return
-
-            self.publish_spin_cmd(0.0)
-            self.startup_spin_done = True
-            self.get_logger().info("Startup spin completed. Beginning frontier exploration.")
+            return
 
         self.cleanup_blacklist()
 
@@ -705,11 +788,12 @@ class FrontierExplorationNode(Node):
                 elapsed = (self.get_clock().now() - self.active_goal_time).nanoseconds / 1e9
                 if elapsed > self.goal_timeout_sec:
                     self.get_logger().info("Goal timeout, selecting a new frontier goal.")
-                    self.blacklist_goal(
-                        self.active_goal_cell,
-                        "timeout/no-reach",
-                        cluster_cells=self.active_goal_cluster,
-                    )
+                    if self.should_blacklist_active_goal_cluster():
+                        self.blacklist_goal(
+                            self.active_goal_cell,
+                            "timeout/no-reach",
+                            cluster_cells=self.active_goal_cluster,
+                        )
                     self.reset_active_goal()
                 elif (
                     self.goal_start_robot_xy is not None
@@ -719,14 +803,20 @@ class FrontierExplorationNode(Node):
                     current_dist = self.euclidean(self.robot_xy, self.active_goal_world)
                     progress = start_dist - current_dist
                     if progress < self.min_progress_m:
+                        if self.is_still_aligning_heading_to_goal():
+                            self.get_logger().info(
+                                "Low linear progress but still turning toward goal heading; keeping current goal."
+                            )
+                            return
                         self.get_logger().info(
                             "Low progress toward goal (%.3fm), selecting new goal." % progress
                         )
-                        self.blacklist_goal(
-                            self.active_goal_cell,
-                            "low-progress",
-                            cluster_cells=self.active_goal_cluster,
-                        )
+                        if self.should_blacklist_active_goal_cluster():
+                            self.blacklist_goal(
+                                self.active_goal_cell,
+                                "low-progress",
+                                cluster_cells=self.active_goal_cluster,
+                            )
                         self.reset_active_goal()
                     else:
                         return
@@ -741,6 +831,7 @@ class FrontierExplorationNode(Node):
             return
 
         frontiers = self.detect_frontiers()
+        self.publish_frontier_cells(frontiers)
         if not frontiers:
             self.publish_cluster_centroids([])
             self.get_logger().info("No frontier cells available.")
@@ -751,6 +842,7 @@ class FrontierExplorationNode(Node):
             self.get_logger().warn("Could not compute reachable free-space from robot cell.")
             return
         frontiers = [cell for cell in frontiers if cell in reachable_cells]
+        self.publish_frontier_cells(frontiers)
         if not frontiers:
             self.publish_cluster_centroids([])
             self.get_logger().info("No reachable frontier cells available.")

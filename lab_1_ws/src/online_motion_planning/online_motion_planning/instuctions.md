@@ -26,8 +26,13 @@ ros2 launch turtlebot_simulation turtlebot_hoi_circuit2_closemod.launch.py
 cd /home/elchina/Documents/HOP_project
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-ros2 launch online_motion_planning online_motion_planning.launch.py
+ros2 launch online_motion_planning online_motion_planning.launch.py mode:=sim 
 
+cd /home/elchina/Documents/HOP_project
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select online_motion_planning
+source install/setup.bash
+ros2 launch online_motion_planning online_motion_planning.launch.py mode:=real
 
 cd /home/elchina/Documents/HOP_project
 source /opt/ros/jazzy/setup.bash
